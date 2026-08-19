@@ -31,16 +31,58 @@ export function savingPercent(before, after) {
 /**
  * 出力ファイル名を作る。拡張子は出力形式に合わせて付け替える。
  * @param {string} name 元のファイル名
- * @param {string} mime 出力の MIME タイプ
+ * @param {string} mime 出力の MIME タイプ（"video/mp4;codecs=..." のような指定も可）
  * @param {string} [suffix] 拡張子の前に付ける文字列
  */
 export function outputName(name, mime, suffix = '-min') {
-  const extensions = { 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/png': 'png' };
+  const extensions = {
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'image/png': 'png',
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+  };
   const dot = name.lastIndexOf('.');
   const stem = dot > 0 ? name.slice(0, dot) : name;
   const original = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
-  const ext = extensions[mime] ?? original ?? 'jpg';
+  const ext = extensions[String(mime).split(';')[0].trim()] ?? original ?? 'jpg';
   return `${stem}${suffix}.${ext}`;
+}
+
+/**
+ * 秒数を「1:05」「1:02:03」のような表記にする。
+ * @param {number} seconds
+ */
+export function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '-';
+  const total = Math.round(seconds);
+  const pad = (value) => String(value).padStart(2, '0');
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  if (hours > 0) return `${hours}:${pad(minutes)}:${pad(total % 60)}`;
+  return `${minutes}:${pad(total % 60)}`;
+}
+
+/**
+ * 秒数を「20 秒」「1 分 35 秒」のように、ざっくり日本語で表す。
+ * @param {number} seconds
+ */
+export function formatApprox(seconds) {
+  if (!Number.isFinite(seconds)) return '-';
+  const total = Math.max(0, Math.ceil(seconds));
+  if (total < 60) return `${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return rest === 0 ? `${minutes} 分` : `${minutes} 分 ${rest} 秒`;
+}
+
+/**
+ * 残り時間の表示。
+ * @param {number} seconds
+ */
+export function formatRemaining(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return 'まもなく完了';
+  return `残り約 ${formatApprox(seconds)}`;
 }
 
 /**

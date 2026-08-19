@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>写真圧縮 — スマホの写真を軽くする</title>
-<meta name="description" content="スマホやPCの写真を、端末の中だけで縮小・圧縮するツール。写真はどこにもアップロードされません。">
+<title>写真・動画圧縮 — スマホの写真と動画を軽くする</title>
+<meta name="description" content="スマホやPCの写真と動画を、端末の中だけで縮小・圧縮するツール。ファイルはどこにもアップロードされません。">
 <meta name="theme-color" content="#0f172a">
 <link rel="manifest" href="./manifest.webmanifest">
 <link rel="icon" href="./icons/icon.svg" type="image/svg+xml">
@@ -13,19 +13,19 @@
 </head>
 <body>
 <header class="site-header">
-  <h1>写真圧縮</h1>
-  <p class="tagline">スマホの写真を、その場で軽く。<br><strong>画像は端末の外に出ません。</strong></p>
+  <h1>写真・動画圧縮</h1>
+  <p class="tagline">スマホの写真と動画を、その場で軽く。<br><strong>ファイルは端末の外に出ません。</strong></p>
 </header>
 
 <main>
   <!-- 写真の選択 -->
   <section id="dropzone" class="dropzone" aria-labelledby="picker-heading">
-    <h2 id="picker-heading" class="visually-hidden">写真を選ぶ</h2>
+    <h2 id="picker-heading" class="visually-hidden">写真・動画を選ぶ</h2>
     <label class="pick-button">
-      <input type="file" id="file-input" accept="image/*" multiple>
-      <span>写真を選ぶ</span>
+      <input type="file" id="file-input" accept="image/*,video/*" multiple>
+      <span>写真・動画を選ぶ</span>
     </label>
-    <p class="dropzone-hint">ドラッグ＆ドロップ・貼り付けにも対応（何枚でもまとめて）</p>
+    <p class="dropzone-hint">ドラッグ＆ドロップ・貼り付けにも対応（何個でもまとめて）</p>
   </section>
 
   <!-- 設定 -->
@@ -78,6 +78,14 @@
         </select>
         <p class="note">位置情報を残すと、写真の撮影場所が相手に伝わります。</p>
       </div>
+      <div class="field">
+        <label for="keep-audio">動画の音声</label>
+        <select id="keep-audio">
+          <option value="keep">そのまま残す</option>
+          <option value="drop">削除する（さらに軽くなります）</option>
+        </select>
+        <p class="note">動画は長辺の設定に合わせて縮小し、画質の設定に応じたビットレートで変換します。</p>
+      </div>
       <div class="field field-check">
         <label><input type="checkbox" id="keep-larger" checked> 元より大きくなる場合は元のまま残す</label>
       </div>
@@ -129,6 +137,16 @@
       </ol>
     </details>
     <details>
+      <summary>動画について</summary>
+      <ul>
+        <li>動画は「変換」ボタンを押したときだけ処理します。<strong>再生しながら録り直す方式のため、動画の長さと同じくらい時間がかかります</strong>（1 分の動画なら約 1 分）。</li>
+        <li>変換中はこのページを開いたままにしてください。画面を閉じたり別のアプリに切り替えると止まることがあります。</li>
+        <li>保存形式は端末が対応するものを選びます（iPhone と最近の Android は MP4、それ以外は WebM）。</li>
+        <li>フレームレートは 30fps を上限にします。60fps の動画は 30fps になります。</li>
+        <li>まずは短い動画で画質を確かめてから、長い動画に進むのがおすすめです。</li>
+      </ul>
+    </details>
+    <details>
       <summary>よくある質問</summary>
       <dl>
         <dt>写真はアップロードされますか？</dt>
@@ -136,7 +154,7 @@
         <dt>元の写真は書き換わりますか？</dt>
         <dd>いいえ。常に新しいファイルとして書き出します。元の写真はそのまま残ります。</dd>
         <dt>どのくらい軽くなりますか？</dt>
-        <dd>スマホで撮った写真なら「おすすめ」設定で 1/5〜1/15 程度が目安です。</dd>
+        <dd>スマホで撮った写真なら「おすすめ」設定で 1/5〜1/15 程度が目安です。動画は元の撮影設定によりますが、4K や高ビットレートの動画ほど大きく減ります。</dd>
         <dt>HEIC（iPhone の写真）は使えますか？</dt>
         <dd>写真アプリから選ぶと自動的に JPEG へ変換されるため、そのまま扱えます。変換されずに読み込めなかった場合はエラーとして表示します。</dd>
       </dl>
@@ -152,13 +170,14 @@
 <dialog id="preview" class="preview">
   <div class="preview-head">
     <div class="switch" role="group" aria-label="表示の切り替え">
-      <button type="button" data-view="after" class="active">圧縮後</button>
-      <button type="button" data-view="before">元の写真</button>
+      <button type="button" data-view="after" class="active">変換後</button>
+      <button type="button" data-view="before">元のファイル</button>
     </div>
     <button type="button" id="preview-close" class="button ghost" aria-label="閉じる">閉じる</button>
   </div>
   <div class="preview-body">
     <img id="preview-image" alt="プレビュー">
+    <video id="preview-video" controls playsinline hidden></video>
   </div>
   <p class="preview-caption" id="preview-caption"></p>
 </dialog>
@@ -171,9 +190,11 @@
     <div class="item-body">
       <p class="item-name"></p>
       <p class="item-meta"></p>
+      <div class="item-progress" hidden><div class="item-progress-bar"></div></div>
     </div>
     <div class="item-side">
       <span class="badge"></span>
+      <button type="button" class="button small item-action" hidden>変換</button>
       <button type="button" class="button small item-save">保存</button>
     </div>
   </li>

@@ -20,11 +20,39 @@ const CRC_TABLE = (() => {
  * @returns {number} CRC-32
  */
 export function crc32(bytes) {
-  let crc = 0xffffffff;
+  return finishCrc(updateCrc(0xffffffff, bytes));
+}
+
+function updateCrc(crc, bytes) {
+  let value = crc;
   for (let i = 0; i < bytes.length; i += 1) {
-    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    value = CRC_TABLE[(value ^ bytes[i]) & 0xff] ^ (value >>> 8);
   }
+  return value;
+}
+
+function finishCrc(crc) {
   return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Blob 全体を読み込まずに CRC-32 を求める。
+ * 動画のような大きなファイルでもメモリを使い切らないようにするため。
+ * @param {Blob} blob
+ * @returns {Promise<number>}
+ */
+async function crc32OfBlob(blob) {
+  if (typeof blob.stream !== 'function') {
+    return crc32(new Uint8Array(await blob.arrayBuffer()));
+  }
+  const reader = blob.stream().getReader();
+  let crc = 0xffffffff;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    crc = updateCrc(crc, value);
+  }
+  return finishCrc(crc);
 }
 
 /** JS の Date を MS-DOS 形式の日付・時刻に変換する */
@@ -64,9 +92,12 @@ export async function createZip(entries) {
 
   for (const [index, entry] of entries.entries()) {
     const nameBytes = encoder.encode(names[index]);
-    const bytes = new Uint8Array(await entry.blob.arrayBuffer());
+    const size = entry.blob.size;
+    if (size >= 0xffffffff) {
+      throw new Error(`${names[index]} は 4GB を超えるため ZIP にまとめられません`);
+    }
     const { time, date } = dosDateTime(new Date(entry.lastModified ?? Date.now()));
-    const checksum = crc32(bytes);
+    const checksum = await crc32OfBlob(entry.blob);
 
     const header = new DataView(new ArrayBuffer(30));
     header.setUint32(0, 0x04034b50, true); // ローカルファイルヘッダー
@@ -76,11 +107,12 @@ export async function createZip(entries) {
     header.setUint16(10, time, true);
     header.setUint16(12, date, true);
     header.setUint32(14, checksum, true);
-    header.setUint32(18, bytes.length, true);
-    header.setUint32(22, bytes.length, true);
+    header.setUint32(18, size, true);
+    header.setUint32(22, size, true);
     header.setUint16(26, nameBytes.length, true);
     header.setUint16(28, 0, true); // 拡張フィールドなし
-    parts.push(new Uint8Array(header.buffer), nameBytes, bytes);
+    // Blob のまま渡し、内容の複製を避ける
+    parts.push(new Uint8Array(header.buffer), nameBytes, entry.blob);
 
     const entryHeader = new DataView(new ArrayBuffer(46));
     entryHeader.setUint32(0, 0x02014b50, true); // セントラルディレクトリ
@@ -91,13 +123,13 @@ export async function createZip(entries) {
     entryHeader.setUint16(12, time, true);
     entryHeader.setUint16(14, date, true);
     entryHeader.setUint32(16, checksum, true);
-    entryHeader.setUint32(20, bytes.length, true);
-    entryHeader.setUint32(24, bytes.length, true);
+    entryHeader.setUint32(20, size, true);
+    entryHeader.setUint32(24, size, true);
     entryHeader.setUint16(28, nameBytes.length, true);
     entryHeader.setUint32(42, offset, true); // ローカルヘッダーの位置
     central.push(new Uint8Array(entryHeader.buffer), nameBytes);
 
-    offset += 30 + nameBytes.length + bytes.length;
+    offset += 30 + nameBytes.length + size;
   }
 
   const centralSize = central.reduce((sum, part) => sum + part.length, 0);

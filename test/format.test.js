@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { fitSize, formatBytes, outputName, savingPercent } from '../src/format.js';
+import { fitSize, formatApprox, formatBytes, formatDuration, formatRemaining, outputName, savingPercent } from '../src/format.js';
 
 test('バイト数を読みやすい単位にする', () => {
   assert.equal(formatBytes(0), '0 B');
@@ -27,6 +27,27 @@ test('出力ファイル名は拡張子を出力形式に合わせる', () => {
   assert.equal(outputName('スクショ.png', 'image/png'), 'スクショ-min.png');
   assert.equal(outputName('拡張子なし', 'image/jpeg'), '拡張子なし-min.jpg');
   assert.equal(outputName('a.b.c.jpg', 'image/jpeg', '_small'), 'a.b.c_small.jpg');
+});
+
+test('動画の出力名は形式に合わせた拡張子になる', () => {
+  assert.equal(outputName('IMG_0002.MOV', 'video/mp4;codecs=avc1.4d002a,mp4a.40.2'), 'IMG_0002-min.mp4');
+  assert.equal(outputName('録画.mp4', 'video/webm'), '録画-min.webm');
+});
+
+test('再生時間を読みやすく表す', () => {
+  assert.equal(formatDuration(9), '0:09');
+  assert.equal(formatDuration(65), '1:05');
+  assert.equal(formatDuration(3725), '1:02:05');
+  assert.equal(formatDuration(Number.POSITIVE_INFINITY), '-');
+});
+
+test('所要時間をざっくり日本語で表す', () => {
+  assert.equal(formatApprox(4), '4 秒');
+  assert.equal(formatApprox(95), '1 分 35 秒');
+  assert.equal(formatApprox(120), '2 分');
+  assert.equal(formatRemaining(20), '残り約 20 秒');
+  assert.equal(formatRemaining(95), '残り約 1 分 35 秒');
+  assert.equal(formatRemaining(0), 'まもなく完了');
 });
 
 test('長辺に合わせて縮小する（拡大はしない）', () => {

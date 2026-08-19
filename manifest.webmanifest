@@ -1,7 +1,7 @@
 {
-  "name": "写真圧縮 — スマホの写真を軽くする",
+  "name": "写真・動画圧縮 — スマホの写真と動画を軽くする",
   "short_name": "写真圧縮",
-  "description": "スマホやPCの写真を端末の中だけで縮小・圧縮するツール。画像はアップロードされません。",
+  "description": "スマホやPCの写真と動画を端末の中だけで縮小・圧縮するツール。ファイルはアップロードされません。",
   "lang": "ja",
   "dir": "ltr",
   "start_url": "./",
@@ -20,7 +20,7 @@
     "method": "POST",
     "enctype": "multipart/form-data",
     "params": {
-      "files": [{ "name": "photos", "accept": ["image/*"] }]
+      "files": [{ "name": "photos", "accept": ["image/*", "video/*"] }]
     }
   }
 }
