@@ -11,6 +11,7 @@
 
 import { fitSize } from './format.js';
 import { Mp4Builder } from './mp4.js';
+import { demuxMp4 } from './mp4demux.js';
 import { estimateVideoBitrate, evenSize } from './videocommon.js';
 
 const AUDIO_BITRATE = 128_000;
@@ -48,16 +49,20 @@ export async function pickFastVideoCodec(width, height, bitrate) {
     'vp09.00.41.08',
   ];
   for (const codec of candidates) {
-    const config = {
+    const base = {
       codec, width, height, bitrate, framerate: 30,
       latencyMode: 'realtime', // B フレームを避け、並び替えを起こさせない
       ...(codec.startsWith('avc1') ? { avc: { format: 'avc' } } : {}),
     };
-    try {
-      const support = await VideoEncoder.isConfigSupported(config);
-      if (support.supported) return config;
-    } catch {
-      // この端末では使えない指定。次の候補へ
+    // ハードウェア符号化器が使えるならそちらを優先する（速度が桁違いに変わる）
+    for (const acceleration of ['prefer-hardware', 'no-preference']) {
+      const config = { ...base, hardwareAcceleration: acceleration };
+      try {
+        const support = await VideoEncoder.isConfigSupported(config);
+        if (support.supported) return config;
+      } catch {
+        // この端末では使えない指定。次の候補へ
+      }
     }
   }
   return null;
@@ -78,11 +83,266 @@ async function pickAudioCodec(sampleRate, channels) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// 復号器に直接流し込む方式（最速）
+// ---------------------------------------------------------------------------
+
+const DECODE_QUEUE_LIMIT = 8;
+const ENCODE_QUEUE_LIMIT = 8;
+
 /**
- * 高速変換を試みる。できなければ null を返す。
- * @returns {Promise<?{blob: Blob, width: number, height: number, audio: boolean, speed: number}>}
+ * MP4 / MOV を読み解いて、符号化済みのデータを復号器へ直接流し込む。
+ * 再生を経由しないので、端末の復号・符号化の速さがそのまま出る。
+ * @returns {Promise<?object>}
  */
-export async function compressVideoFast(file, options, { video, duration, onProgress, signal } = {}) {
+export async function transcodeDirect(file, options, { onProgress, signal } = {}) {
+  if (!canUseFastVideo()) return bail('WebCodecs 非対応');
+  onProgress?.({ phase: 'prepare', ratio: 0 });
+  const parsed = await demuxMp4(file).catch(() => null);
+  if (!parsed) return bail('MP4 として読み解けない');
+
+  const { video, audio, duration, reader } = parsed;
+  if (!duration || !video.width || !video.height) return bail('長さまたは解像度が読めない');
+
+  const decoderConfig = await resolveDecoderConfig({
+    codec: video.codec,
+    codedWidth: video.width,
+    codedHeight: video.height,
+    ...(video.description ? { description: video.description } : {}),
+  });
+  if (!decoderConfig) return bail(`復号できない形式 (${video.codec})`);
+
+  // 縦向き動画は画素が横向きのまま入っているので、表示上の向きに直してから縮小する
+  const rotation = video.rotation ?? 0;
+  const upright = rotation === 90 || rotation === 270
+    ? { width: video.height, height: video.width }
+    : { width: video.width, height: video.height };
+  const target = evenSize(fitSize(upright.width, upright.height, options.maxEdge));
+  const sourceBitrate = (file.size * 8) / duration;
+  const encoderConfig = await pickFastVideoCodec(
+    target.width, target.height,
+    estimateVideoBitrate(target.width, target.height, options.quality, sourceBitrate),
+  );
+  if (!encoderConfig) return bail('使える映像コーデックがない');
+
+  const builder = new Mp4Builder();
+  const videoTrack = builder.addVideoTrack({
+    codec: encoderConfig.codec, width: target.width, height: target.height,
+  });
+
+  // 音声は再符号化せず、そのまま移し替える（速く、音質も落ちない）
+  const keepAudio = options.keepAudio && Boolean(audio);
+  const audioTrack = keepAudio ? builder.addAudioTrack({
+    codec: audio.codec,
+    description: audio.description ?? new Uint8Array(0),
+    descriptionKind: audio.format === 'Opus' ? 'dOps' : 'AudioSpecificConfig',
+    sampleRate: audio.sampleRate,
+    channels: audio.channels,
+    bitrate: 128_000,
+    timescale: audio.timescale,
+  }) : null;
+
+  const started = Date.now();
+  const ok = await runDirectTranscode({
+    reader, video, audio: keepAudio ? audio : null, duration, target, rotation,
+    decoderConfig, encoderConfig, builder, videoTrack, audioTrack, signal, onProgress, started,
+  });
+  if (!ok) return bail('復号または符号化に失敗した');
+  if (builder.hasReorderedSamples()) return bail('フレームの順序が入れ替わっている');
+  if (encoderConfig.codec.startsWith('avc1') && !builder.tracks[videoTrack].description) {
+    return bail('符号化器の設定を取得できない');
+  }
+
+  return {
+    blob: builder.finish(),
+    width: target.width,
+    height: target.height,
+    sourceWidth: upright.width,
+    sourceHeight: upright.height,
+    duration,
+    audio: keepAudio,
+    speed: duration / Math.max(0.001, (Date.now() - started) / 1000),
+  };
+}
+
+/** この端末で使える復号器の設定を返す。無ければ null */
+async function resolveDecoderConfig(base) {
+  // ハードウェア復号を優先しつつ、駄目なら指定なしで試す
+  for (const acceleration of ['prefer-hardware', 'no-preference']) {
+    const config = { ...base, hardwareAcceleration: acceleration };
+    try {
+      const support = await VideoDecoder.isConfigSupported(config);
+      if (support.supported) return config;
+    } catch {
+      // 次の指定で試す
+    }
+  }
+  return null;
+}
+
+/** 復号 → 縮小 → 符号化 を、待ち行列が溢れないように回す */
+async function runDirectTranscode({
+  reader, video, audio, duration, target, rotation, decoderConfig, encoderConfig,
+  builder, videoTrack, audioTrack, signal, onProgress, started,
+}) {
+  // 回転が必要なとき、または縮小するときは Canvas を経由する
+  const needsCanvas = rotation !== 0
+    || target.width !== video.width || target.height !== video.height;
+  const canvas = needsCanvas ? document.createElement('canvas') : null;
+  if (canvas) {
+    canvas.width = target.width;
+    canvas.height = target.height;
+  }
+  const context = canvas?.getContext('2d', { alpha: false });
+  if (context && rotation !== 0) {
+    // 中心を軸に回してから描くよう、あらかじめ座標系を移しておく
+    context.translate(target.width / 2, target.height / 2);
+    context.rotate((rotation * Math.PI) / 180);
+  }
+  const swap = rotation === 90 || rotation === 270;
+  const drawWidth = swap ? target.height : target.width;
+  const drawHeight = swap ? target.width : target.height;
+  const frameDuration = Math.round(1_000_000 / 30);
+
+  let failure = null;
+  let firstChunk = true;
+  let lastKey = -Infinity;
+
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      if (firstChunk) {
+        firstChunk = false;
+        const description = metadata?.decoderConfig?.description;
+        if (description) builder.tracks[videoTrack].description = new Uint8Array(description);
+      }
+      const data = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(data);
+      builder.addSample(videoTrack, {
+        data, timestamp: chunk.timestamp, duration: chunk.duration ?? frameDuration,
+        keyFrame: chunk.type === 'key',
+      });
+    },
+    error: (error) => { failure = error; },
+  });
+  encoder.configure(encoderConfig);
+
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      try {
+        if (failure) return;
+        const keyFrame = frame.timestamp - lastKey >= KEYFRAME_INTERVAL;
+        if (keyFrame) lastKey = frame.timestamp;
+        if (needsCanvas) {
+          if (rotation === 0) context.drawImage(frame, 0, 0, drawWidth, drawHeight);
+          else context.drawImage(frame, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+          const scaled = new VideoFrame(canvas, {
+            timestamp: frame.timestamp,
+            duration: frame.duration ?? frameDuration,
+          });
+          encoder.encode(scaled, { keyFrame });
+          scaled.close();
+        } else {
+          encoder.encode(frame, { keyFrame });
+        }
+      } catch (error) {
+        failure = error;
+      } finally {
+        frame.close();
+      }
+    },
+    error: (error) => { failure = error; },
+  });
+  decoder.configure(decoderConfig);
+
+  // 映像と音声を、ファイル上の並び順にまとめて読む（読み込みの無駄が少ない）
+  const queue = [
+    ...video.samples.map((sample) => ({ sample, kind: 'video' })),
+    ...(audio ? audio.samples.map((sample) => ({ sample, kind: 'audio' })) : []),
+  ].sort((a, b) => a.sample.offset - b.sample.offset);
+
+  try {
+    let done = 0;
+    for (const { sample, kind } of queue) {
+      if (signal?.aborted) throw new DOMException('変換を中止しました', 'AbortError');
+      if (failure) break;
+      const data = await reader.read(sample.offset, sample.size);
+      if (kind === 'audio') {
+        builder.addSample(audioTrack, {
+          data: data.slice(),
+          timestamp: Math.round((sample.cts / audio.timescale) * 1_000_000),
+          duration: Math.round((sample.duration / audio.timescale) * 1_000_000),
+          keyFrame: true,
+        });
+        continue;
+      }
+      decoder.decode(new EncodedVideoChunk({
+        type: sample.keyFrame ? 'key' : 'delta',
+        timestamp: Math.round((sample.cts / video.timescale) * 1_000_000),
+        duration: Math.round((sample.duration / video.timescale) * 1_000_000),
+        data,
+      }));
+      done += 1;
+      if (done % 4 === 0) {
+        const ratio = done / video.samples.length;
+        onProgress?.({
+          phase: 'convert', ratio,
+          speed: (ratio * duration) / Math.max(0.001, (Date.now() - started) / 1000),
+        });
+      }
+      await waitForQueues(decoder, encoder);
+    }
+    if (failure) throw failure;
+    await decoder.flush();
+    await encoder.flush();
+    return !failure && !firstChunk;
+  } finally {
+    if (decoder.state !== 'closed') decoder.close();
+    if (encoder.state !== 'closed') encoder.close();
+    if (canvas) {
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+  }
+}
+
+/**
+ * 待ち行列が空くまで待つ（メモリの使い過ぎを防ぐ）。
+ * 処理が 1 つ終わった時点ですぐ再開できるよう、時間ではなく通知で待つ。
+ */
+function waitForDequeue(codec) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { codec.ondequeue = null; } catch { /* 未対応なら何もしない */ }
+      resolve();
+    };
+    const timer = setTimeout(finish, 4); // ondequeue が無い端末向けの保険
+    try {
+      codec.ondequeue = finish;
+    } catch {
+      // 未対応。時間で待つ
+    }
+  });
+}
+
+async function waitForQueues(decoder, encoder) {
+  while (decoder.decodeQueueSize > DECODE_QUEUE_LIMIT || encoder.encodeQueueSize > ENCODE_QUEUE_LIMIT) {
+    await waitForDequeue(decoder.decodeQueueSize > DECODE_QUEUE_LIMIT ? decoder : encoder);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 再生しながら取り込む方式
+// ---------------------------------------------------------------------------
+
+/**
+ * 再生しながら取り込む方式（MP4 として読み解けない動画向け）。
+ * @returns {Promise<?object>}
+ */
+export async function transcodeWithPlayback(file, options, { video, duration, onProgress, signal } = {}) {
   if (!canUseFastVideo()) return bail('WebCodecs 非対応');
   if (!duration || !video?.videoWidth) return bail('長さまたは解像度が読めない');
 
@@ -127,8 +387,16 @@ export async function compressVideoFast(file, options, { video, duration, onProg
   if (needsDescription && !builder.tracks[videoTrack].description) return bail('符号化器の設定を取得できない');
 
   const blob = builder.finish();
-  const speed = duration / Math.max(0.001, (Date.now() - started) / 1000);
-  return { blob, width: target.width, height: target.height, audio: audioAdded === true, speed };
+  return {
+    blob,
+    width: target.width,
+    height: target.height,
+    sourceWidth: video.videoWidth,
+    sourceHeight: video.videoHeight,
+    duration,
+    audio: audioAdded === true,
+    speed: duration / Math.max(0.001, (Date.now() - started) / 1000),
+  };
 }
 
 // ---------------------------------------------------------------------------

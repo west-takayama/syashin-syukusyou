@@ -7,7 +7,7 @@
  * どちらも端末内で完結し、追加のライブラリは使わない。
  */
 
-import { canUseFastVideo, compressVideoFast } from './fastvideo.js';
+import { canUseFastVideo, transcodeDirect, transcodeWithPlayback } from './fastvideo.js';
 import { fitSize } from './format.js';
 import { CAPTURE_FPS, estimateVideoBitrate, evenSize } from './videocommon.js';
 
@@ -57,33 +57,30 @@ export async function compressVideo(file, options, { onProgress, signal } = {}) 
     throw new Error('この端末のブラウザは動画の変換に対応していません');
   }
   onProgress?.({ phase: 'prepare', ratio: 0 });
+
+  // 1) 復号器に直接流し込む方式（最速）。再生を経由しないので <video> も要らない
+  const direct = await tryFast(
+    () => transcodeDirect(file, options, { onProgress, signal }),
+    file, options, onProgress,
+  );
+  if (direct) return direct;
+
+  // 2) ここから先は再生が必要になる
   const { video, url } = await loadVideo(file);
   try {
     const duration = await readDuration(video);
     const source = { width: video.videoWidth, height: video.videoHeight };
     if (!source.width || !source.height) throw new Error('この動画はブラウザで読み込めませんでした');
 
-    // 1) 速い方式から試す
-    if (canUseFastVideo()) {
-      try {
-        const fast = await compressVideoFast(file, options, { video, duration, onProgress, signal });
-        if (fast) {
-          onProgress?.({ phase: 'verify', ratio: 1, speed: fast.speed });
-          if (await verifyOutput(fast.blob, { ...fast, duration })) {
-            return finishResult(file, options, source, duration, {
-              ...fast, container: 'video/mp4', method: 'webcodecs',
-            });
-          }
-          console.info('[写真・動画圧縮] 高速変換の出力を確認できませんでした。確実な方式でやり直します');
-        }
-      } catch (error) {
-        if (error?.name === 'AbortError') throw error;
-        console.warn('高速変換に失敗したため、確実な方式でやり直します', error);
-      }
-      await resetVideo(video);
-    }
+    // 2-1) 再生速度を上げて取り込む方式
+    const played = await tryFast(
+      () => transcodeWithPlayback(file, options, { video, duration, onProgress, signal }),
+      file, options, onProgress,
+    );
+    if (played) return played;
+    await resetVideo(video);
 
-    // 2) 確実な方式でやり直す
+    // 2-2) 等倍で録り直す確実な方式
     onProgress?.({ phase: 'convert', ratio: 0, speed: 1 });
     const recorded = await recordRealtime({ file, video, duration, source, options, onProgress, signal });
     return finishResult(file, options, source, duration, recorded);
@@ -93,6 +90,39 @@ export async function compressVideo(file, options, { onProgress, signal } = {}) 
     video.load();
     URL.revokeObjectURL(url);
   }
+}
+
+/** 一度でも高速変換の出力を確認できたら、以降は確認を省いて時間を稼ぐ */
+let outputVerified = false;
+
+/**
+ * 高速変換を試し、出力が再生できることを確かめてから採用する。
+ * 駄目なら null を返して、呼び出し側が次の方式に進む。
+ */
+async function tryFast(run, file, options, onProgress) {
+  if (!canUseFastVideo()) return null;
+  let fast = null;
+  try {
+    fast = await run();
+  } catch (error) {
+    if (error?.name === 'AbortError') throw error;
+    console.warn('高速変換に失敗したため、次の方式でやり直します', error);
+    return null;
+  }
+  if (!fast) return null;
+
+  if (!outputVerified) {
+    onProgress?.({ phase: 'verify', ratio: 1, speed: fast.speed });
+    if (!await verifyOutput(fast.blob, fast)) {
+      console.info('[写真・動画圧縮] 高速変換の出力を確認できませんでした。次の方式でやり直します');
+      return null;
+    }
+    outputVerified = true;
+  }
+  const source = { width: fast.sourceWidth, height: fast.sourceHeight };
+  return finishResult(file, options, source, fast.duration, {
+    ...fast, container: 'video/mp4', method: 'webcodecs',
+  });
 }
 
 /** 元より大きくなった場合は元ファイルを使う */
@@ -254,7 +284,7 @@ function videoName(name, mime) {
 async function loadVideo(file) {
   const url = URL.createObjectURL(file);
   const video = document.createElement('video');
-  video.preload = 'auto';
+  video.preload = 'metadata'; // 必要になった時点で読み込ませる
   video.playsInline = true;
   video.crossOrigin = 'anonymous';
   video.src = url;

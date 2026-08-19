@@ -5,7 +5,7 @@
  * （Web Share Target）も受け持つ。
  */
 
-const CACHE = 'syashin-syukusyou-v3';
+const CACHE = 'syashin-syukusyou-v4';
 const SHARE_CACHE = 'syashin-syukusyou-shared';
 
 const ASSETS = [
@@ -19,6 +19,7 @@ const ASSETS = [
   './src/fastvideo.js',
   './src/format.js',
   './src/mp4.js',
+  './src/mp4demux.js',
   './src/video.js',
   './src/videocommon.js',
   './src/zip.js',

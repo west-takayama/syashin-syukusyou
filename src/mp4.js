@@ -132,9 +132,12 @@ function videoSampleEntry(track) {
 }
 
 function audioSampleEntry(track) {
-  const { codec, description, channels, sampleRate, bitrate } = track;
+  const { codec, description, descriptionKind, channels, sampleRate, bitrate } = track;
   const name = codec.startsWith('mp4a') ? 'mp4a' : 'Opus';
-  const config = name === 'mp4a' ? esds(description, bitrate) : dOps(description);
+  // 元の動画から音声をそのまま移す場合は、設定ボックスの中身も出来合いのものを使う
+  const config = name === 'mp4a'
+    ? esds(description, bitrate)
+    : (descriptionKind === 'dOps' ? box('dOps', description) : dOps(description));
   return box(name,
     u8(0, 0, 0, 0, 0, 0), u16(1), // reserved, data_reference_index
     u32(0), u32(0), // reserved
@@ -234,10 +237,15 @@ export class Mp4Builder {
 
   /**
    * 音声トラックを追加する。
-   * @param {{codec: string, description: Uint8Array, sampleRate: number, channels: number, bitrate: number}} config
+   * descriptionKind に 'dOps' を渡すと、description をそのまま設定ボックスとして書く
+   * （元の動画から音声を移すとき用）。
+   * @param {{codec: string, description: Uint8Array, descriptionKind?: string,
+   *   sampleRate: number, channels: number, bitrate: number, timescale?: number}} config
    */
   addAudioTrack(config) {
-    this.tracks.push({ kind: 'audio', timescale: config.sampleRate, samples: [], ...config });
+    this.tracks.push({
+      kind: 'audio', timescale: config.timescale ?? config.sampleRate, samples: [], ...config,
+    });
     return this.tracks.length - 1;
   }
 
