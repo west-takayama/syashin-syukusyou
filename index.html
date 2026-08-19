@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>写真圧縮 — スマホの写真を軽くする</title>
+<meta name="description" content="スマホやPCの写真を、端末の中だけで縮小・圧縮するツール。写真はどこにもアップロードされません。">
+<meta name="theme-color" content="#0f172a">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="./icons/icon-180.png">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<header class="site-header">
+  <h1>写真圧縮</h1>
+  <p class="tagline">スマホの写真を、その場で軽く。<br><strong>画像は端末の外に出ません。</strong></p>
+</header>
+
+<main>
+  <!-- 写真の選択 -->
+  <section id="dropzone" class="dropzone" aria-labelledby="picker-heading">
+    <h2 id="picker-heading" class="visually-hidden">写真を選ぶ</h2>
+    <label class="pick-button">
+      <input type="file" id="file-input" accept="image/*" multiple>
+      <span>写真を選ぶ</span>
+    </label>
+    <p class="dropzone-hint">ドラッグ＆ドロップ・貼り付けにも対応（何枚でもまとめて）</p>
+  </section>
+
+  <!-- 設定 -->
+  <section class="settings" aria-labelledby="settings-heading">
+    <h2 id="settings-heading">圧縮の設定</h2>
+
+    <div class="presets" id="presets" role="group" aria-label="プリセット">
+      <button type="button" class="chip" data-preset="light">かるく<small>長辺1280・標準画質</small></button>
+      <button type="button" class="chip" data-preset="balanced">おすすめ<small>長辺1920・高画質</small></button>
+      <button type="button" class="chip" data-preset="fine">きれい<small>長辺2560・最高画質</small></button>
+      <button type="button" class="chip" data-preset="keep">サイズそのまま<small>再圧縮のみ</small></button>
+    </div>
+
+    <details class="advanced" id="advanced">
+      <summary>詳しい設定</summary>
+      <div class="field">
+        <label for="max-edge">長辺の最大サイズ</label>
+        <select id="max-edge">
+          <option value="640">640 px（メール添付向け）</option>
+          <option value="1024">1024 px</option>
+          <option value="1280">1280 px（SNS・LINE向け）</option>
+          <option value="1600">1600 px</option>
+          <option value="1920" selected>1920 px（フルHD）</option>
+          <option value="2560">2560 px</option>
+          <option value="3200">3200 px</option>
+          <option value="4096">4096 px</option>
+          <option value="0">制限しない（等倍）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="quality">画質 <output id="quality-value">80</output></label>
+        <input type="range" id="quality" min="40" max="100" step="5" value="80">
+        <p class="note">数字が小さいほど軽くなります。写真なら 75〜85 くらいが目安です。</p>
+      </div>
+      <div class="field">
+        <label for="format">保存形式</label>
+        <select id="format">
+          <option value="auto">自動（写真は JPEG）</option>
+          <option value="image/jpeg">JPEG</option>
+          <option value="image/webp">WebP（より軽い）</option>
+          <option value="image/png">PNG（圧縮率は低い）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="metadata">撮影情報（Exif）</label>
+        <select id="metadata">
+          <option value="strip">すべて削除する（おすすめ）</option>
+          <option value="keep">撮影日時・カメラ情報は残す</option>
+          <option value="keep-gps">撮影日時・位置情報も残す</option>
+        </select>
+        <p class="note">位置情報を残すと、写真の撮影場所が相手に伝わります。</p>
+      </div>
+      <div class="field field-check">
+        <label><input type="checkbox" id="keep-larger" checked> 元より大きくなる場合は元のまま残す</label>
+      </div>
+    </details>
+  </section>
+
+  <!-- 結果 -->
+  <section class="results" id="results" hidden aria-labelledby="results-heading">
+    <h2 id="results-heading" class="visually-hidden">圧縮結果</h2>
+
+    <div class="summary" id="summary">
+      <div class="summary-main">
+        <span class="summary-before" id="summary-before">-</span>
+        <span class="summary-arrow" aria-hidden="true">→</span>
+        <span class="summary-after" id="summary-after">-</span>
+      </div>
+      <p class="summary-saving" id="summary-saving"></p>
+      <div class="progress" id="progress" hidden>
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <p class="status" id="status" role="status" aria-live="polite"></p>
+    </div>
+
+    <div class="actions">
+      <button type="button" id="share-all" class="button primary" hidden>写真アプリに保存 / 共有</button>
+      <button type="button" id="download-all" class="button primary">まとめて保存（ZIP）</button>
+      <button type="button" id="clear-all" class="button ghost">クリア</button>
+    </div>
+
+    <ul class="items" id="items"></ul>
+  </section>
+
+  <!-- 使い方 -->
+  <section class="help">
+    <h2>保存のしかた</h2>
+    <details>
+      <summary>iPhone / iPad</summary>
+      <ol>
+        <li>各写真の「保存」または上の「写真アプリに保存 / 共有」を押します。</li>
+        <li>共有シートで「画像を保存」を選ぶと、写真アプリに追加されます。</li>
+        <li>元の写真は、容量を空けたい場合のみ写真アプリで削除してください。</li>
+      </ol>
+    </details>
+    <details>
+      <summary>Android</summary>
+      <ol>
+        <li>「保存」を押すとダウンロードフォルダに保存されます。</li>
+        <li>「写真アプリに保存 / 共有」からギャラリーアプリへ直接送ることもできます。</li>
+      </ol>
+    </details>
+    <details>
+      <summary>よくある質問</summary>
+      <dl>
+        <dt>写真はアップロードされますか？</dt>
+        <dd>いいえ。読み込み・圧縮・保存のすべてが端末内で完結し、通信は発生しません。一度開けば機内モードでも使えます。</dd>
+        <dt>元の写真は書き換わりますか？</dt>
+        <dd>いいえ。常に新しいファイルとして書き出します。元の写真はそのまま残ります。</dd>
+        <dt>どのくらい軽くなりますか？</dt>
+        <dd>スマホで撮った写真なら「おすすめ」設定で 1/5〜1/15 程度が目安です。</dd>
+        <dt>HEIC（iPhone の写真）は使えますか？</dt>
+        <dd>写真アプリから選ぶと自動的に JPEG へ変換されるため、そのまま扱えます。変換されずに読み込めなかった場合はエラーとして表示します。</dd>
+      </dl>
+    </details>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <p>すべての処理は端末内で行われます。<a href="https://github.com/west-takayama/syashin-syukusyou">ソースコード</a></p>
+</footer>
+
+<!-- 圧縮前後の見比べ -->
+<dialog id="preview" class="preview">
+  <div class="preview-head">
+    <div class="switch" role="group" aria-label="表示の切り替え">
+      <button type="button" data-view="after" class="active">圧縮後</button>
+      <button type="button" data-view="before">元の写真</button>
+    </div>
+    <button type="button" id="preview-close" class="button ghost" aria-label="閉じる">閉じる</button>
+  </div>
+  <div class="preview-body">
+    <img id="preview-image" alt="プレビュー">
+  </div>
+  <p class="preview-caption" id="preview-caption"></p>
+</dialog>
+
+<template id="item-template">
+  <li class="item">
+    <button type="button" class="thumb" aria-label="拡大して見比べる">
+      <img alt="">
+    </button>
+    <div class="item-body">
+      <p class="item-name"></p>
+      <p class="item-meta"></p>
+    </div>
+    <div class="item-side">
+      <span class="badge"></span>
+      <button type="button" class="button small item-save">保存</button>
+    </div>
+  </li>
+</template>
+
+<script type="module" src="./src/app.js"></script>
+</body>
+</html>

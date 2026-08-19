@@ -1,0 +1,13 @@
+{
+  "name": "syashin-syukusyou",
+  "version": "1.0.0",
+  "private": true,
+  "description": "スマホの写真を端末内だけで縮小・圧縮するウェブツール",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node tools/serve.js",
+    "test": "node --test",
+    "icons": "python3 tools/make-icons.py"
+  }
+}
