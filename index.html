@@ -139,7 +139,8 @@
     <details>
       <summary>動画について</summary>
       <ul>
-        <li>動画は「変換」ボタンを押したときだけ処理します。<strong>再生しながら録り直す方式のため、動画の長さと同じくらい時間がかかります</strong>（1 分の動画なら約 1 分）。</li>
+        <li>動画は「変換」ボタンを押したときだけ処理します。進み具合・残り時間・処理中のコマが表示されます。</li>
+        <li>変換の速さは端末によって変わります。対応端末では実時間より速く終わり、そうでない場合は動画の長さと同じくらいかかります（表示される「目安」は遅い方の想定です）。</li>
         <li>変換中はこのページを開いたままにしてください。画面を閉じたり別のアプリに切り替えると止まることがあります。</li>
         <li>保存形式は端末が対応するものを選びます（iPhone と最近の Android は MP4、それ以外は WebM）。</li>
         <li>フレームレートは 30fps を上限にします。60fps の動画は 30fps になります。</li>
@@ -186,6 +187,7 @@
   <li class="item">
     <button type="button" class="thumb" aria-label="拡大して見比べる">
       <img alt="">
+      <canvas class="thumb-live" width="72" height="72" hidden></canvas>
     </button>
     <div class="item-body">
       <p class="item-name"></p>

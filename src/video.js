@@ -1,12 +1,15 @@
 /**
  * 動画の縮小・再エンコード。
  *
- * ブラウザ標準の MediaRecorder で「再生しながら録り直す」方式を使う。
- * 追加のライブラリが要らず端末内で完結する代わりに、
- * 変換には元の動画と同じだけの時間がかかる。
+ * 2 つの方式を持ち、速い方から順に試す。
+ *   1. WebCodecs 方式（src/fastvideo.js）… 再生速度を上げて取り込むので実時間より速い
+ *   2. MediaRecorder 方式（この中）……… 等倍で再生しながら録り直す。確実だが実時間かかる
+ * どちらも端末内で完結し、追加のライブラリは使わない。
  */
 
+import { canUseFastVideo, compressVideoFast } from './fastvideo.js';
 import { fitSize } from './format.js';
+import { CAPTURE_FPS, estimateVideoBitrate, evenSize } from './videocommon.js';
 
 /** 保存形式の候補。写真アプリに追加しやすい MP4 (H.264) を優先する */
 const MIME_CANDIDATES = [
@@ -19,8 +22,6 @@ const MIME_CANDIDATES = [
   'video/webm',
 ];
 
-/** 取り込むフレームレート。60fps の動画はここまで落として容量を稼ぐ */
-const CAPTURE_FPS = 30;
 const AUDIO_BITRATE = 128_000;
 
 let supportedMime;
@@ -41,48 +42,133 @@ export function canCompressVideo() {
     && typeof document.createElement('canvas').captureStream === 'function';
 }
 
-/**
- * 動画のビットレートを決める。
- * 画素数とフレームレートに比例させ、元の動画より高くならないように抑える。
- * @param {number} width
- * @param {number} height
- * @param {number} quality 0〜1
- * @param {number} [sourceBitrate] 元動画のビットレート（bps）
- * @returns {number} bps
- */
-export function estimateVideoBitrate(width, height, quality, sourceBitrate = 0) {
-  const level = Math.min(1, Math.max(0, (quality - 0.4) / 0.6));
-  const bitsPerPixel = 0.02 + 0.08 * level;
-  const estimate = width * height * CAPTURE_FPS * bitsPerPixel;
-  const capped = sourceBitrate > 0 ? Math.min(estimate, sourceBitrate * 0.9) : estimate;
-  return Math.round(Math.min(Math.max(capped, 200_000), 20_000_000));
-}
-
-/** H.264 は縦横が偶数である必要があるため、切り下げて揃える */
-function evenSize({ width, height }) {
-  return {
-    width: Math.max(2, width - (width % 2)),
-    height: Math.max(2, height - (height % 2)),
-  };
-}
+// ビットレートの計算は方式によらず共通
+export { estimateVideoBitrate } from './videocommon.js';
 
 /**
  * 動画を縮小・再エンコードする。
+ * まず WebCodecs 方式を試し、使えない・失敗した場合は MediaRecorder 方式でやり直す。
  * @param {File} file
  * @param {import('./compress.js').CompressOptions & {keepAudio: boolean}} options
- * @param {{onProgress?: (ratio: number) => void, signal?: AbortSignal}} [hooks]
+ * @param {{onProgress?: (info: {phase: string, ratio: number, speed?: number}) => void, signal?: AbortSignal}} [hooks]
  */
 export async function compressVideo(file, options, { onProgress, signal } = {}) {
-  const mime = pickVideoMime();
-  if (!mime) throw new Error('この端末のブラウザは動画の変換に対応していません');
-
+  if (!pickVideoMime() && !canUseFastVideo()) {
+    throw new Error('この端末のブラウザは動画の変換に対応していません');
+  }
+  onProgress?.({ phase: 'prepare', ratio: 0 });
   const { video, url } = await loadVideo(file);
-  const cleanup = [];
   try {
     const duration = await readDuration(video);
     const source = { width: video.videoWidth, height: video.videoHeight };
     if (!source.width || !source.height) throw new Error('この動画はブラウザで読み込めませんでした');
 
+    // 1) 速い方式から試す
+    if (canUseFastVideo()) {
+      try {
+        const fast = await compressVideoFast(file, options, { video, duration, onProgress, signal });
+        if (fast) {
+          onProgress?.({ phase: 'verify', ratio: 1, speed: fast.speed });
+          if (await verifyOutput(fast.blob, { ...fast, duration })) {
+            return finishResult(file, options, source, duration, {
+              ...fast, container: 'video/mp4', method: 'webcodecs',
+            });
+          }
+          console.info('[写真・動画圧縮] 高速変換の出力を確認できませんでした。確実な方式でやり直します');
+        }
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        console.warn('高速変換に失敗したため、確実な方式でやり直します', error);
+      }
+      await resetVideo(video);
+    }
+
+    // 2) 確実な方式でやり直す
+    onProgress?.({ phase: 'convert', ratio: 0, speed: 1 });
+    const recorded = await recordRealtime({ file, video, duration, source, options, onProgress, signal });
+    return finishResult(file, options, source, duration, recorded);
+  } finally {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** 元より大きくなった場合は元ファイルを使う */
+function finishResult(file, options, source, duration, output) {
+  const shared = {
+    kind: 'video', sourceWidth: source.width, sourceHeight: source.height,
+    duration, audio: output.audio, speed: output.speed, method: output.method,
+  };
+  if (options.keepLargerOriginal && output.blob.size >= file.size) {
+    return {
+      ...shared, blob: file, name: file.name, mime: file.type || output.container,
+      width: source.width, height: source.height, skipped: true,
+    };
+  }
+  return {
+    ...shared, blob: output.blob, name: videoName(file.name, output.container), mime: output.container,
+    width: output.width, height: output.height, skipped: false,
+  };
+}
+
+/** 高速変換の出力が本当に再生できるか確かめる（駄目なら従来方式にやり直す） */
+async function verifyOutput(blob, { width, height, duration }) {
+  const url = URL.createObjectURL(blob);
+  const probe = document.createElement('video');
+  probe.preload = 'auto';
+  probe.muted = true;
+  probe.playsInline = true;
+  probe.src = url;
+  try {
+    await withTimeout(new Promise((resolve, reject) => {
+      probe.onloadedmetadata = resolve;
+      probe.onerror = () => reject(new Error('再生できません'));
+    }), 10_000);
+    if (probe.videoWidth !== width || probe.videoHeight !== height) return false;
+    if (!Number.isFinite(probe.duration)) return false;
+    if (Math.abs(probe.duration - duration) > Math.max(1, duration * 0.15)) return false;
+
+    // 実際に 1 コマ取り出せるか確かめる
+    await withTimeout(new Promise((resolve, reject) => {
+      probe.onseeked = resolve;
+      probe.onerror = () => reject(new Error('再生できません'));
+      probe.currentTime = Math.min(0.2, duration / 2);
+    }), 10_000);
+    return probe.readyState >= 2;
+  } catch {
+    return false;
+  } finally {
+    probe.removeAttribute('src');
+    probe.load();
+    URL.revokeObjectURL(url);
+  }
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((resolve, reject) => setTimeout(() => reject(new Error('時間切れ')), ms)),
+  ]);
+}
+
+/** 高速変換を試した後、従来方式のために再生位置と設定を戻す */
+async function resetVideo(video) {
+  video.pause();
+  video.playbackRate = 1;
+  video.muted = false;
+  await seekTo(video, 0);
+}
+
+/**
+ * MediaRecorder 方式：等倍で再生しながら録り直す。確実だが実時間かかる。
+ */
+async function recordRealtime({ file, video, duration, source, options, onProgress, signal }) {
+  const mime = pickVideoMime();
+  if (!mime) throw new Error('この端末のブラウザは動画の変換に対応していません');
+  const cleanup = [];
+  try {
     const target = evenSize(fitSize(source.width, source.height, options.maxEdge));
     const canvas = document.createElement('canvas');
     canvas.width = target.width;
@@ -143,26 +229,15 @@ export async function compressVideo(file, options, { onProgress, signal } = {}) 
     if (recorder.state !== 'inactive') recorder.stop();
     const blob = await recorded;
 
-    if (options.keepLargerOriginal && blob.size >= file.size) {
-      return {
-        blob: file, name: file.name, mime: file.type || container, kind: 'video',
-        width: source.width, height: source.height, sourceWidth: source.width, sourceHeight: source.height,
-        duration, audio: audioAttached, skipped: true,
-      };
-    }
     return {
-      blob, name: videoName(file.name, container), mime: container, kind: 'video',
-      width: target.width, height: target.height, sourceWidth: source.width, sourceHeight: source.height,
-      duration, audio: audioAttached, skipped: false,
+      blob, container, width: target.width, height: target.height,
+      audio: audioAttached, speed: 1, method: 'recorder',
     };
   } finally {
     for (const task of cleanup.reverse()) {
       try { task(); } catch { /* 後始末の失敗は無視する */ }
     }
     video.pause();
-    video.removeAttribute('src');
-    video.load();
-    URL.revokeObjectURL(url);
   }
 }
 
@@ -198,19 +273,47 @@ async function loadVideo(file) {
 /**
  * 長さを読む。
  * WebM などでは長さが未確定 (Infinity) のことがあるため、
- * いったん末尾まで送って確定させる。
+ * いったん末尾まで送って確定させてから先頭に戻す。
  */
 async function readDuration(video) {
   if (Number.isFinite(video.duration) && video.duration > 0) return video.duration;
-  return new Promise((resolve) => {
+
+  const duration = await new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
     const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer); // 変換中に再生位置を戻してしまわないよう必ず止める
       video.ontimeupdate = null;
-      video.currentTime = 0;
       resolve(Number.isFinite(video.duration) ? video.duration : 0);
     };
     video.ontimeupdate = done;
-    video.currentTime = 1e101;
-    setTimeout(done, 2000);
+    timer = setTimeout(done, 2000);
+    video.currentTime = 1e101; // 末尾まで送ると長さが確定する
+  });
+  await seekTo(video, 0);
+  return duration;
+}
+
+/** 指定位置まで移動し、完了を待つ（応答が無い場合も止まらないようにする） */
+function seekTo(video, time) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      video.onseeked = null;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(done, 3000);
+    video.onseeked = done;
+    try {
+      video.currentTime = time;
+    } catch {
+      done();
+    }
   });
 }
 
@@ -238,11 +341,7 @@ export async function readVideoInfo(file, posterEdge = 160) {
 async function grabPoster(video, duration, maxEdge) {
   if (!video.videoWidth) return null;
   try {
-    await new Promise((resolve) => {
-      video.onseeked = resolve;
-      video.currentTime = duration > 0.2 ? 0.1 : 0;
-      setTimeout(resolve, 3000); // シークできない形式でも待ち続けない
-    });
+    await seekTo(video, duration > 0.2 ? 0.1 : 0);
     const size = fitSize(video.videoWidth, video.videoHeight, maxEdge);
     const canvas = document.createElement('canvas');
     canvas.width = size.width;
@@ -290,7 +389,12 @@ function drawFrames(video, context, canvas, duration, onProgress, cleanup) {
   const draw = () => {
     if (!running) return;
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
-    if (onProgress && duration > 0) onProgress(Math.min(1, video.currentTime / duration));
+    if (duration > 0) {
+      onProgress?.({
+        phase: 'convert', speed: 1, canvas,
+        ratio: Math.min(1, video.currentTime / duration),
+      });
+    }
     schedule();
   };
   const schedule = () => {

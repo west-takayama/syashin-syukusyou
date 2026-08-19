@@ -232,7 +232,9 @@ output { font-variant-numeric: tabular-nums; }
   background: var(--surface-2);
   cursor: pointer;
 }
-.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb img,
+.thumb canvas { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb canvas[hidden] { display: none; }
 .item[data-status="working"] .thumb { animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.45; } }
 
@@ -247,13 +249,17 @@ output { font-variant-numeric: tabular-nums; }
 
 /* 動画の変換の進み具合 */
 .item-progress {
-  height: 4px;
+  height: 6px;
   background: var(--surface-2);
   border-radius: 999px;
   overflow: hidden;
   margin-top: 6px;
 }
 .item-progress-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+.item[data-status="working"] .item-meta { color: var(--text); font-weight: 700; }
+.badge.working { background: color-mix(in srgb, var(--accent) 16%, var(--surface)); color: var(--accent); }
+/* 変換中は再生マークを消して、処理中のコマがそのまま見えるようにする */
+.item[data-kind="video"][data-status="working"] .thumb::after { content: none; }
 
 .item-side { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 .item[data-kind="video"] .thumb { position: relative; }

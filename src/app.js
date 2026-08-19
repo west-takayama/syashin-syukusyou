@@ -60,6 +60,8 @@ const el = {
  * @property {?string} posterUrl 一覧のサムネイル（動画は静止画を作る）
  * @property {?HTMLElement} el
  * @property {number} progress 0〜1（動画の変換中のみ）
+ * @property {?string} phase 変換の段階（準備中・変換中など）
+ * @property {number} speed 実時間に対する変換の速さ（2 なら 2 倍速）
  * @property {?AbortController} controller
  * @property {?object} info 動画の元情報（長さ・解像度）
  */
@@ -153,10 +155,19 @@ function applyPreset(name) {
 function onSettingsChanged() {
   syncSettingsView();
   saveSettings();
-  // 動画は設定変更では自動変換せず、「もう一度変換」の案内だけ出す
+
+  // 設定が変わった時点で、古い結果は保存できないようにしておく
+  const signature = signatureOf(currentOptions());
   for (const item of items) {
-    if (item.kind === 'video') renderItem(item);
+    if (item.kind === 'video') {
+      renderItem(item); // 動画は自動変換せず「もう一度変換」の案内だけ出す
+    } else if (item.signature && item.signature !== signature && item.status !== 'working') {
+      item.status = 'pending';
+      renderItem(item);
+    }
   }
+  updateSummary();
+
   clearTimeout(settingsTimer);
   settingsTimer = setTimeout(requestRun, 350); // 続けて操作されたときの無駄打ちを防ぐ
 }
@@ -190,7 +201,7 @@ function addFiles(fileList) {
       id: nextId++, file, kind: video ? 'video' : 'image',
       status: video ? 'ready' : 'pending',
       result: null, error: null, signature: null, previewUrl: null, posterUrl: null, el: null,
-      progress: 0, controller: null, info: null,
+      progress: 0, phase: null, speed: 0, controller: null, info: null,
     };
     items.push(item);
     renderItem(item);
@@ -322,6 +333,8 @@ async function convertVideo(item) {
   item.controller = controller;
   item.status = 'working';
   item.progress = 0;
+  item.phase = 'prepare';
+  item.speed = 0;
   item.error = null;
   renderItem(item);
   updateSummary();
@@ -330,13 +343,15 @@ async function convertVideo(item) {
   try {
     const result = await compressVideo(item.file, options, {
       signal: controller.signal,
-      onProgress: (ratio) => {
-        item.progress = ratio;
-        // 1 コマごとに描き替えると無駄なので、表示の更新は 0.25 秒おきにする
+      onProgress: (info) => {
+        item.progress = info.ratio ?? item.progress;
+        item.phase = info.phase ?? item.phase;
+        if (info.speed) item.speed = info.speed;
+        // 1 コマごとに描き替えると無駄なので、表示の更新は 0.2 秒おきにする
         const now = Date.now();
-        if (now - lastPainted < 250) return;
+        if (now - lastPainted < 200 && info.phase === 'convert') return;
         lastPainted = now;
-        renderItemProgress(item);
+        renderItemProgress(item, info.canvas);
       },
     });
     setPreviewUrl(item, URL.createObjectURL(result.blob));
@@ -354,6 +369,7 @@ async function convertVideo(item) {
   } finally {
     item.controller = null;
     item.progress = 0;
+    item.phase = null;
     renderItem(item);
     updateSummary();
   }
@@ -416,6 +432,7 @@ function renderItem(item) {
   node.querySelector('.item-name').textContent = item.result?.name ?? item.file.name;
   const thumbnail = thumbnailUrl(item);
   if (thumbnail && image.src !== thumbnail) image.src = thumbnail;
+  if (item.status !== 'working') node.querySelector('.thumb-live').hidden = true;
 
   badge.className = 'badge';
   actionButton.hidden = true;
@@ -449,7 +466,7 @@ function renderItem(item) {
   } else if (item.status === 'ready') {
     // 動画は「変換」を押したときだけ処理する（長さと同じだけ時間がかかるため）
     meta.textContent = item.info?.duration
-      ? `${describeSource(item)} ・ 変換に約 ${formatApprox(item.info.duration)}かかります`
+      ? `${describeSource(item)} ・ 変換の目安 約 ${formatApprox(item.info.duration)}`
       : describeSource(item);
     badge.textContent = '動画';
     badge.className = 'badge neutral';
@@ -458,7 +475,8 @@ function renderItem(item) {
     actionButton.textContent = '変換';
     actionButton.classList.add('primary');
   } else if (item.status === 'working' && item.kind === 'video') {
-    badge.textContent = '変換中';
+    badge.textContent = '…';
+    badge.className = 'badge working';
     saveButton.hidden = true;
     actionButton.hidden = false;
     actionButton.textContent = '中止';
@@ -469,21 +487,51 @@ function renderItem(item) {
   renderItemProgress(item);
 }
 
-/** 動画の変換中だけ、進み具合と残り時間を更新する */
-function renderItemProgress(item) {
+const PHASE_LABELS = {
+  prepare: '準備中…',
+  audio: '音声を処理中…',
+  verify: '仕上げ中…',
+};
+
+/**
+ * 動画の変換中の表示を更新する。
+ * 進み具合・残り時間・変換の速さに加えて、いま処理しているコマも映して
+ * 「止まっていない」ことが分かるようにする。
+ */
+function renderItemProgress(item, frame) {
   const node = item.el;
   if (!node) return;
   const progress = node.querySelector('.item-progress');
+  const live = node.querySelector('.thumb-live');
   const working = item.kind === 'video' && item.status === 'working';
   progress.hidden = !working;
-  if (!working) return;
+  if (!working) {
+    live.hidden = true;
+    return;
+  }
 
   const percent = Math.round(item.progress * 100);
-  node.querySelector('.item-progress-bar').style.width = `${percent}%`;
+  node.querySelector('.item-progress-bar').style.width = `${item.phase === 'convert' ? percent : 100}%`;
+  node.querySelector('.badge').textContent = item.phase === 'convert' ? `${percent}%` : '…';
+
   const duration = item.info?.duration ?? 0;
-  node.querySelector('.item-meta').textContent = duration > 0
-    ? `変換中 ${percent}% ・ ${formatRemaining(duration * (1 - item.progress))}`
-    : '変換中…';
+  const speed = item.speed > 0.1 ? item.speed : 1;
+  const parts = [];
+  if (item.phase === 'convert') {
+    parts.push(`変換中 ${percent}%`);
+    if (duration > 0) parts.push(formatRemaining((duration * (1 - item.progress)) / speed));
+    if (item.speed >= 1.15) parts.push(`${item.speed.toFixed(1)} 倍速`);
+  } else {
+    parts.push(PHASE_LABELS[item.phase] ?? '変換中…');
+  }
+  node.querySelector('.item-meta').textContent = parts.join(' ・ ');
+
+  // いま符号化しているコマをサムネイル代わりに映す
+  if (frame && frame.width > 0) {
+    live.hidden = false;
+    const context = live.getContext('2d');
+    context.drawImage(frame, 0, 0, live.width, live.height);
+  }
 }
 
 function updateSummary() {
